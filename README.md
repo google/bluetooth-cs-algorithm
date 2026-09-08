@@ -34,4 +34,4 @@ The testbench will process the data and generate a JSON file (defaulting to `ran
 
 
 Eligibility for the [Google Open Source Software Vulnerability Rewards
-Program](https://bughunters.google.com/open-source-security) is determined by the [Google Open Source Software Vulnerability Reward Program Rules](https://bughunters.google.com/about/rules/open-source/google-open-source-software-vulnerability-reward-program-rules).# bluetooth-cs-algorithm
+Program](https://bughunters.google.com/open-source-security) is determined by the [Google Open Source Software Vulnerability Reward Program Rules](https://bughunters.google.com/about/rules/open-source/google-open-source-software-vulnerability-reward-program-rules).

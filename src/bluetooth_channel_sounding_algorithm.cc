@@ -63,14 +63,15 @@ template <typename T>
 inline Eigen::Vector<T, Eigen::Dynamic> select_by_mask(
     const Eigen::Vector<T, Eigen::Dynamic>& data,
     const Eigen::Vector<bool, Eigen::Dynamic>& mask) {
-  std::vector<T> result;
+  Eigen::Vector<T, Eigen::Dynamic> result(data.size());
+  int count = 0;
   for (int i = 0; i < data.size(); ++i) {
     if (mask(i)) {
-      result.push_back(data(i));
+      result(count++) = data(i);
     }
   }
-  return Eigen::Map<Eigen::Vector<T, Eigen::Dynamic>>(result.data(),
-                                                      result.size());
+  result.conservativeResize(count);
+  return result;
 }
 
 template <typename T>
@@ -289,7 +290,7 @@ void ChannelSoundingAlgorithm::ParseRawData(
 }
 
 void ChannelSoundingAlgorithm::ChangeAlgoConfig() {
-  // // change config on the fly
+  // change config on the fly
   std::string algo_type = GetProperty("bluetooth.vendor.cs.algo_type", "MUSIC");
 
   uint8_t selected_ap = GetIntProperty("bluetooth.vendor.cs.selected_ap", 0);
