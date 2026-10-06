@@ -39,8 +39,10 @@ using ::aidl::android::hardware::bluetooth::ranging::
 using ::aidl::android::hardware::bluetooth::ranging::Config;
 using ::aidl::android::hardware::bluetooth::ranging::ModeData;
 using ::aidl::android::hardware::bluetooth::ranging::ModeType;
+using ::aidl::android::hardware::bluetooth::ranging::ModeTwoData;
 using ::aidl::android::hardware::bluetooth::ranging::PctIQSample;
 using ::aidl::android::hardware::bluetooth::ranging::ProcedureEnableConfig;
+using ::aidl::android::hardware::bluetooth::ranging::SubeventResultData;
 using ::android::base::GetBoolProperty;
 using ::android::base::GetIntProperty;
 using ::android::base::GetProperty;
@@ -56,6 +58,112 @@ static constexpr uint8_t kCsAntennaPermutationArray[24][4] = {
     {4, 2, 1, 3}, {2, 4, 1, 3}, {1, 4, 3, 2}, {4, 1, 3, 2}, {1, 3, 4, 2},
     {3, 1, 4, 2}, {3, 4, 1, 2}, {4, 3, 1, 2}, {4, 2, 3, 1}, {2, 4, 3, 1},
     {4, 3, 2, 1}, {3, 4, 2, 1}, {3, 2, 4, 1}, {2, 3, 4, 1}};
+
+static constexpr int kCsMaxAntennaPaths = 4;
+static constexpr size_t kCsAntennaPermutationRowCount =
+    sizeof(kCsAntennaPermutationArray) / sizeof(kCsAntennaPermutationArray[0]);
+static constexpr size_t kCsAntennaPermutationColCount =
+    sizeof(kCsAntennaPermutationArray[0]);
+
+// antennaPermutationIndex is an int8_t that ParseProcedureData() converts to
+// uint8_t before using it as a row index, and the tone count decides how many
+// columns of that row are read. Validate both, together with the antenna path
+// every tone maps to (pct_initiator_/pct_reflector_ hold exactly
+// num_antenna_paths + 1 entries), so that malformed procedure data is
+// rejected before it can size a container or index a table.
+static bool ValidateModeTwoData(const ModeTwoData& data,
+                                size_t num_antenna_paths) {
+  const int permutation_index = data.antennaPermutationIndex;
+  if (permutation_index < 0 ||
+      static_cast<size_t>(permutation_index) >= kCsAntennaPermutationRowCount) {
+    LOG(WARNING) << __func__ << ": antennaPermutationIndex " << permutation_index
+                 << " out of range [0, " << kCsAntennaPermutationRowCount << ")";
+    return false;
+  }
+  const size_t num_tones = data.tonePctIQSamples.size();
+  for (size_t k = 0; k < num_tones; k++) {
+    if (k == num_antenna_paths) {
+      continue;  // the last tone uses num_antenna_paths directly
+    }
+    if (k >= kCsAntennaPermutationColCount) {
+      LOG(WARNING) << __func__ << ": " << num_tones << " tones for "
+                   << num_antenna_paths << " antenna paths";
+      return false;
+    }
+    const size_t antenna_path =
+        kCsAntennaPermutationArray[permutation_index][k] - 1;  // 0-based
+    if (antenna_path > num_antenna_paths) {
+      LOG(WARNING) << __func__ << ": permutation " << permutation_index
+                   << " maps tone " << k << " to antenna path " << antenna_path
+                   << " > " << num_antenna_paths;
+      return false;
+    }
+  }
+  return true;
+}
+
+// Returns false if any Mode-2 step in the procedure would make
+// ParseProcedureData() read outside kCsAntennaPermutationArray or push a tone
+// into an antenna path slot that does not exist.
+static bool ValidateProcedureData(
+    const ChannelSoundingProcedureData& procedure_data,
+    size_t num_antenna_paths) {
+  auto validate_subevents = [num_antenna_paths](
+                                const std::vector<SubeventResultData>&
+                                    subevents) {
+    for (const auto& subevent : subevents) {
+      for (const auto& step : subevent.stepData) {
+        if (step.stepMode != ModeType::TWO) {
+          continue;
+        }
+        if (!ValidateModeTwoData(
+                step.stepModeData.get<ModeData::Tag::modeTwoData>(),
+                num_antenna_paths)) {
+          LOG(WARNING) << __func__ << ": rejecting malformed procedure";
+          return false;
+        }
+      }
+    }
+    return true;
+  };
+  return validate_subevents(procedure_data.initiatorSubeventResultData) &&
+         validate_subevents(procedure_data.reflectorSubeventResultData);
+}
+
+// Returns false when ParseRawData() would dereference a missing optional or
+// read past the end of a tone array. Reflector tone arrays may be empty
+// (one-sided PCT), but a non-empty one must cover every step channel.
+static bool ValidateRawData(const ChannelSoudingRawData& raw_data) {
+  const auto& initiator = raw_data.initiatorData.stepTonePcts;
+  const auto& reflector = raw_data.reflectorData.stepTonePcts;
+  const size_t num_steps = raw_data.stepChannels.size();
+  const size_t n_ap = initiator->size() - 1;  // as computed by ParseRawData
+
+  for (size_t ap = 0; ap < initiator->size(); ap++) {
+    const auto& tone = (*initiator)[ap];
+    if (!tone.has_value() || tone->tonePcts.size() < num_steps) {
+      LOG(WARNING) << __func__ << ": initiator antenna path " << ap
+                   << " has no tone PCTs for " << num_steps << " steps";
+      return false;
+    }
+  }
+  if (n_ap > 0) {
+    if (!reflector.has_value() || reflector->size() < n_ap) {
+      LOG(WARNING) << __func__ << ": reflector tone PCTs missing";
+      return false;
+    }
+    for (size_t ap = 0; ap < reflector->size(); ap++) {
+      const auto& tone = (*reflector)[ap];
+      if (!tone.has_value() ||
+          (!tone->tonePcts.empty() && tone->tonePcts.size() < num_steps)) {
+        LOG(WARNING) << __func__ << ": reflector antenna path " << ap
+                     << " has invalid tone PCTs for " << num_steps << " steps";
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 namespace {
 
@@ -150,15 +258,25 @@ double ChannelSoundingAlgorithm::EstimateDistanceImpl(const std::any& data) {
   const auto* raw_data = std::any_cast<ChannelSoudingRawData>(&data);
 
   if (raw_data) {
-    // mode-1 has no PCT (check initiator)
-    if (raw_data->initiatorData.stepTonePcts.value()[0]
-            .value()
-            .tonePcts.empty()) {
+    const auto& initiator_pcts = raw_data->initiatorData.stepTonePcts;
+    if (!initiator_pcts.has_value() || initiator_pcts->empty()) {
+      LOG(WARNING) << __func__ << ": missing initiator tone PCTs";
+      return raw_distance_;
+    }
+    if (!(*initiator_pcts)[0].has_value() ||
+        (*initiator_pcts)[0]->tonePcts.empty()) {
+      // mode-1 has no PCT (check initiator)
+      return raw_distance_;
+    }
+    if (!ValidateRawData(*raw_data)) {
       return raw_distance_;
     }
 
     this->ParseRawData(*raw_data);
-    dataCleaning.Run(*this);
+    if (!dataCleaning.Run(*this)) {
+      LOG(WARNING) << __func__ << ": data cleaning failed";
+      return raw_distance_ > 0 ? raw_distance_ : 0.0;
+    }
     rangingAlgorithm.Run(*this);
     return raw_distance_ > 0 ? raw_distance_ : 0.0;
   }
@@ -174,7 +292,10 @@ double ChannelSoundingAlgorithm::EstimateDistanceImpl(const std::any& data) {
       LOG(WARNING) << __func__ << " checkPCTSize fail";
       return raw_distance_;
     }
-    dataCleaning.Run(*this);
+    if (!dataCleaning.Run(*this)) {
+      LOG(WARNING) << __func__ << ": data cleaning failed";
+      return raw_distance_ > 0 ? raw_distance_ : 0.0;
+    }
     rangingAlgorithm.Run(*this);
     return raw_distance_ > 0 ? raw_distance_ : 0.0;
   }
@@ -346,7 +467,25 @@ void ChannelSoundingAlgorithm::ParseProcedureData(
                  << ": invalid, initiatorSubeventResultData is empty";
     return;
   }
-  n_ap_ = procedure_data.initiatorSubeventResultData[0].numAntennaPaths;
+
+  // numAntennaPaths and antennaPermutationIndex are supplied by the peer
+  // device: reject the whole procedure when they are out of range instead of
+  // sizing containers or indexing tables with them.
+  const int num_antenna_paths =
+      procedure_data.initiatorSubeventResultData[0].numAntennaPaths;
+  if (num_antenna_paths < 1 || num_antenna_paths > kCsMaxAntennaPaths) {
+    LOG(WARNING) << __func__ << ": invalid numAntennaPaths "
+                 << num_antenna_paths << ", rejecting procedure";
+    step_channel_.clear();
+    return;
+  }
+  if (!ValidateProcedureData(procedure_data,
+                             static_cast<size_t>(num_antenna_paths))) {
+    step_channel_.clear();
+    return;
+  }
+
+  n_ap_ = static_cast<size_t>(num_antenna_paths);
   reference_power_level_initiator_ =
       procedure_data.initiatorSubeventResultData[0].referencePowerLevelDbm;
 
@@ -501,20 +640,39 @@ bool ChannelSoundingAlgorithm::CheckPCTSize() const {
   return true;
 }
 
-void ChannelSoundingAlgorithm::DataCleaning::Run(
+bool ChannelSoundingAlgorithm::DataCleaning::Run(
     ChannelSoundingAlgorithm& cs_algo) {
+  if (cs_algo.step_channel_.size() < 2) {
+    LOG(WARNING) << __func__ << ": only " << cs_algo.step_channel_.size()
+                 << " steps";
+    return false;
+  }
   ChannelSoundingAlgorithm::DataCleaning::MultiplyPCT(cs_algo);
   if (cs_algo.fix_doppler_) {
     ChannelSoundingAlgorithm::DataCleaning::FixDoppler(cs_algo);
   }
   ChannelSoundingAlgorithm::DataCleaning::SortPCT(cs_algo);
 
-  ChannelSoundingAlgorithm::DataCleaning::UpdateDeltaF(cs_algo);
+  if (!ChannelSoundingAlgorithm::DataCleaning::UpdateDeltaF(cs_algo)) {
+    LOG(WARNING) << __func__ << ": unusable step channel spacing";
+    return false;
+  }
+  // autocorr_K_ / delta_f_ is the lag count that sizes both the
+  // autocorrelation and the covariance matrix below; a zero lag would build
+  // an empty matrix that the ranging algorithms cannot process.
+  if (cs_algo.autocorr_K_ / cs_algo.delta_f_ == 0) {
+    LOG(WARNING) << __func__ << ": channel spacing "
+                 << static_cast<int>(cs_algo.delta_f_)
+                 << " MHz exceeds autocorr_K "
+                 << static_cast<int>(cs_algo.autocorr_K_);
+    return false;
+  }
   if (cs_algo.algo_type_ == AlgoType::kZpIfft) {
     ChannelSoundingAlgorithm::DataCleaning::CalculateAutocorr(cs_algo);
   } else if (cs_algo.algo_type_ == AlgoType::kMusic) {
     ChannelSoundingAlgorithm::DataCleaning::CalculateCovarianceMatrix(cs_algo);
   }
+  return true;
 }
 
 void ChannelSoundingAlgorithm::DataCleaning::MultiplyPCT(
@@ -967,20 +1125,26 @@ void ChannelSoundingAlgorithm::DataCleaning::FixDopplerFragmented(
   }
 }
 
-void ChannelSoundingAlgorithm::DataCleaning::UpdateDeltaF(
+bool ChannelSoundingAlgorithm::DataCleaning::UpdateDeltaF(
     ChannelSoundingAlgorithm& cs_algo) {
-  uint8_t df =
-      cs_algo.step_channel_cleaned_[cs_algo.step_channel_cleaned_.size() - 1] -
-      cs_algo.step_channel_cleaned_[0];
-  for (size_t i = 1; i < cs_algo.step_channel_cleaned_.size(); i++) {
-    if (cs_algo.step_channel_cleaned_[i] -
-            cs_algo.step_channel_cleaned_[i - 1] <
-        df) {
-      df = cs_algo.step_channel_cleaned_[i] -
-           cs_algo.step_channel_cleaned_[i - 1];
+  const std::vector<uint8_t>& channels = cs_algo.step_channel_cleaned_;
+  if (channels.size() < 2) {
+    LOG(WARNING) << __func__ << ": only " << channels.size()
+                 << " distinct step channels";
+    return false;
+  }
+  uint8_t df = channels.back() - channels.front();
+  for (size_t i = 1; i < channels.size(); i++) {
+    if (channels[i] - channels[i - 1] < df) {
+      df = channels[i] - channels[i - 1];
     }
   }
+  if (df == 0) {
+    LOG(WARNING) << __func__ << ": zero channel spacing";
+    return false;
+  }
   cs_algo.delta_f_ = df;
+  return true;
 }
 
 void ChannelSoundingAlgorithm::DataCleaning::CalculateAutocorr(
@@ -1404,8 +1568,13 @@ double ChannelSoundingAlgorithm::RangingAlgorithm::PostCombiningChooseMin(
   if (confidence_report > 0.0) {
     cs_algo.raw_distance_ = distance_report;
     cs_algo.confidence_level_ = confidence_report;
-  } else {
+  } else if (!cs_algo.raw_distance_collection_.empty()) {
     cs_algo.raw_distance_ = cs_algo.raw_distance_collection_[0];
+    cs_algo.confidence_level_ = 0.0;
+  } else {
+    // No per-antenna estimate exists (e.g. no antenna paths were used); keep
+    // the default distance instead of reading element 0 of an empty vector.
+    LOG(WARNING) << __func__ << ": no distance estimates available";
     cs_algo.confidence_level_ = 0.0;
   }
 

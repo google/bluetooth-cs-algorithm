@@ -106,7 +106,9 @@ class ChannelSoundingAlgorithm : public ::bluetooth_hal::extensions::cs::
    public:
     DataCleaning() = default;
 
-    void Run(ChannelSoundingAlgorithm& cs_algo);
+    // Returns false when the step channel set cannot be used (fewer than two
+    // distinct channels, zero channel spacing, or a zero autocorrelation lag).
+    bool Run(ChannelSoundingAlgorithm& cs_algo);
 
    private:
     void MultiplyPCT(ChannelSoundingAlgorithm& cs_algo);
@@ -117,7 +119,7 @@ class ChannelSoundingAlgorithm : public ::bluetooth_hal::extensions::cs::
 
     void FixDopplerFragmented(ChannelSoundingAlgorithm& cs_algo);
 
-    void UpdateDeltaF(ChannelSoundingAlgorithm& cs_algo);
+    bool UpdateDeltaF(ChannelSoundingAlgorithm& cs_algo);
 
     void CalculateAutocorr(ChannelSoundingAlgorithm& cs_algo);
 
